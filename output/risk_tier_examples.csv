@@ -1,0 +1,4 @@
+scenario,risk_prob,tier,action
+Low risk,0.05,Low,No action beyond a normal reminder.
+Elevated risk,0.49293054116291,Elevated,Proactive outreach recommended: payment plan (DPA) offer + HEAP screening before day 20.
+High risk,0.837981919976948,High,Priority outreach before Final Termination Notice window; DPA + HEAP screening + cold-weather protection check.

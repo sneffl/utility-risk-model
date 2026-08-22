@@ -1,0 +1,13 @@
+tier,income_label,bill_label,bill,income,stress_index,expected_months_to_disconnect,p_disconnected_6mo,p_disconnected_12mo
+Elevated,"Moderate income ($3,000/mo)",August + heatwave,327.74,3000,0.1092,84.6,0.0358,0.1039
+Elevated,"Moderate income ($3,000/mo)",Typical August bill,300.13,3000,0.1,95.1,0.0318,0.0926
+Elevated,"Near HEAP-eligible ($1,800/mo)",August + heatwave,327.74,1800,0.1821,40.2,0.0758,0.214
+Elevated,"Near HEAP-eligible ($1,800/mo)",Typical August bill,300.13,1800,0.1667,46,0.0661,0.1879
+High,"Moderate income ($3,000/mo)",August + heatwave,327.74,3000,0.1092,45.1,0.0733,0.1965
+High,"Moderate income ($3,000/mo)",Typical August bill,300.13,3000,0.1,50.5,0.0652,0.1761
+High,"Near HEAP-eligible ($1,800/mo)",August + heatwave,327.74,1800,0.1821,22,0.1536,0.3849
+High,"Near HEAP-eligible ($1,800/mo)",Typical August bill,300.13,1800,0.1667,25.1,0.1343,0.342
+Low,"Moderate income ($3,000/mo)",August + heatwave,327.74,3000,0.1092,291.6,0.0097,0.0297
+Low,"Moderate income ($3,000/mo)",Typical August bill,300.13,3000,0.1,328.9,0.0086,0.0264
+Low,"Near HEAP-eligible ($1,800/mo)",August + heatwave,327.74,1800,0.1821,135.4,0.0206,0.0633
+Low,"Near HEAP-eligible ($1,800/mo)",Typical August bill,300.13,1800,0.1667,155.8,0.0179,0.0552

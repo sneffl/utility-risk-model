@@ -1,0 +1,10 @@
+name: utility-risk-model
+title:
+username: hugogarcia
+account: hugogarcia
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 17735093
+bundleId: 12446687
+url: https://hugogarcia.shinyapps.io/utility-risk-model/
+version: 1

@@ -1,0 +1,8 @@
+day_offset,event,category
+0,Bill due; balance unpaid,billing
+20,Utility may issue a Final Termination Notice (HEFPA allows this starting 20 days after the due date) [1],notice
+35,Earliest lawful disconnection date -- HEFPA requires >=15 days' notice after the Final Termination Notice [1],disconnection
+35,A 1.5%/month late payment charge has been accruing on the unpaid balance since the due date [1],fee
+,"Nov 1 - Apr 15 only: cold-weather protections apply -- utility must attempt direct contact >=3 days before shutoff, and cannot disconnect for 15 business days after a required social-services referral, regardless of the day-35 date above [1]",protection
+35,"If disconnected: service is restored once the account is resolved; a reconnection fee applies, set by the utility's own tariff (commonly $20-$150+ for electric, more after-hours; NY does not publish one universal statewide amount) [3]",fee
+,If the unpaid balance is referred to a third-party debt collector: THIS is the point (not the missed payment itself) at which it can appear on a credit report. New York utilities generally do not report routine on-time/late payment history to the three major credit bureaus themselves [2],credit

@@ -1,0 +1,446 @@
+---
+title: "Utility Non-Payment Risk & Consequence Model"
+subtitle: "Predicting electricity billing risk from real smart-meter data, and modeling what actually happens next"
+author: "Hugo Garcia Moreno"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(knitr)
+})
+out_dir <- "../output"  # knitting runs from report/, so outputs live one level up
+```
+
+## 1. What this project actually does
+
+Most student "predict the bill" projects stop at forecasting a dollar amount.
+This one chains four pieces together:
+
+```
+[Real NYC weather] --> [Degree-day regression] --> [Predicted monthly bill]
+                                                            |
+                                                            v
+[Real SGCC usage data] --> [Logistic reg. + tree] --> [ML risk tier] --> [Markov chain risk engine] --> [P(disconnected), E[months to disconnect]]
+                                                                                   ^
+                                                                                   |
+                                                                    [HEFPA-cited consequence cascade]
+```
+
+1. **Statistically**, can the *pattern* of a household's or business's
+   electricity usage (the shape of it over time, separate from the dollar
+   amount) predict whether they're at elevated risk of a serious
+   non-payment or billing problem? (Section 4.)
+2. **Physically**, how does a local weather record turn into a predicted
+   monthly bill, and what does an actual heatwave do to it? (Section 5.)
+3. **Stochastically**, if a bill's status is a state (current, late,
+   severely late, disconnected), how does it move between those states over
+   time, and how long does that take, as a function of risk tier and
+   bill-to-income stress? (Section 6, a discrete-time Markov chain.)
+4. **As a matter of policy**, once a bill actually goes unpaid, what happens
+   next, in calendar days and dollars? And where can available protections
+   interrupt that sequence? (Section 7.)
+
+Piece 1 is a machine-learning pipeline trained on individually labeled
+utility data. Piece 2 is a physical model (the same degree-day method
+utilities use for weather-normalized billing) run on historical NYC
+temperatures. Piece 3 is linear algebra, but where no public dataset
+exists to fit its inputs, those inputs are **stated modeling assumptions,
+not measurements**, and the report says so at the point each one is
+introduced. Piece 4 is a small rules engine built from actual New York
+State utility regulation, with each rule cited. **These are kept in
+separate scripts on purpose.** A statistical risk score, an assumed
+transition probability, and a legal deadline are three different kinds of
+claim, and blending them into one number would hide the distinctions a
+reader needs in order to trust or challenge any of this.
+
+## 2. Data
+
+```{r load-data}
+dt <- readRDS(file.path(out_dir, "clean_wide.rds"))
+features <- readRDS(file.path(out_dir, "features.rds"))
+flag_tab <- table(dt$FLAG)
+```
+
+The consumption data is the public **State Grid Corporation of China (SGCC)
+electricity-theft dataset**: `r format(nrow(dt), big.mark = ",")` real
+electricity customers, daily meter readings from **`r format(min(readRDS(file.path(out_dir, 'dates_sorted.rds'))))`
+to `r format(max(readRDS(file.path(out_dir, 'dates_sorted.rds'))))`**, each
+labeled `FLAG = 1` if the utility confirmed the account for electricity
+theft/billing fraud. It was released alongside a peer-reviewed paper:
+
+> Zheng, Z., Yang, Y., Niu, X., Dai, H.-N., & Zhou, Y. (2018). "Wide and Deep
+> Convolutional Neural Networks for Electricity-Theft Detection to Secure
+> Smart Grids." *IEEE Transactions on Industrial Informatics*, 14(4),
+> 1606-1615. <https://doi.org/10.1109/TII.2017.2785963>
+
+**Being precise about what `FLAG` means:** this dataset labels confirmed
+electricity theft (meter tampering / bypass), which utilities treat as the
+most serious form of revenue loss from a customer relationship. It is not
+literally "this household missed a bill." I'm using it as the closest
+publicly available, individually-labeled, real-world proxy for "this
+account's usage behavior correlates with serious non-payment risk," which is
+an honest and common substitution in this research area (there is no public
+dataset that labels ordinary missed payments at the individual level, for
+obvious privacy reasons). Section 5 returns to this limitation.
+
+Class balance: **`r flag_tab["0"]`** normal accounts vs. **`r flag_tab["1"]`**
+flagged (`r sprintf("%.1f%%", 100 * flag_tab["1"] / sum(flag_tab))`).
+That imbalance is realistic for this kind of problem, and it drives the
+modeling choices in Section 4.
+
+## 3. From a raw meter reading to a feature table
+
+A theft or non-payment signal doesn't live in any single day's kWh
+reading. It lives in the *shape* of usage over time. Working straight off the
+`r ncol(dt) - 2`-day-wide raw matrix, I engineered
+`r length(setdiff(names(features), c('CONS_NO','FLAG')))` per-customer
+statistical features: overall level and volatility, the share of missing or
+exactly-zero reads, the longest gap in reporting, a linear trend over the
+whole series, weekday/weekend and winter/summer ratios, and year-over-year
+drift.
+
+**A real data-cleaning problem showed up immediately:** a handful of accounts in this "residential" file report
+usage in the thousands of kWh/day (almost certainly commercial/industrial
+meters mixed into the file). Naive ratio features (`weekend usage / weekday
+usage`, `winter / summer`, `2016 usage / 2014 usage`) blew up toward infinity
+whenever one of these accounts had a near-zero reading in the denominator
+period. For roughly 1% of accounts this wasn't a rounding error, it was
+values in the *thousands*. The fix was to switch these three features from a
+raw ratio to a **log-ratio** (`log1p(period A) - log1p(period B)`): same
+"which period was higher, by roughly what multiple" information, but bounded
+and stable as usage approaches zero. `range_ratio` was left as a plain ratio
+but winsorized at the 1st/99th percentile. This is the kind of thing that
+looks like a footnote but actually determines whether a model is measuring
+signal or measuring an outlier. See `scripts/02_feature_engineering.R` for
+the full before/after.
+
+```{r feature-dist, fig.cap="Distributions of four of the strongest features, split by outcome."}
+include_graphics(file.path(out_dir, "plots", "feature_distributions.png"))
+```
+
+Flagged accounts show up as (a) noticeably higher day-to-day volatility once
+you control for scale, (b) more missing/zero reads and longer reporting gaps,
+and (c) a more pronounced upward drift in usage from 2014 to 2016, all
+patterns that make physical sense for a tampered meter that is used more
+freely over time and reported on less reliably.
+
+## 4. Modeling non-payment/theft risk
+
+```{r load-models}
+mr <- readRDS(file.path(out_dir, "model_results.rds"))
+```
+
+Two models were trained on a 70/30 stratified split (`r format(nrow(mr$test), big.mark=",")`
+held-out test customers): an interpretable **logistic regression** and a
+**decision tree** (`rpart`), both trained cost-sensitively to counter the
+~89%/11% class imbalance: observations were weighted (logistic) or the
+tree's split loss was penalized (decision tree) so that missing a true
+flagged account costs roughly `r round((1 - mr$pos_rate) / mr$pos_rate, 1)`x
+more than a false alarm, matching the actual class imbalance.
+
+**Why not just report accuracy?** Because a model that predicts "not at risk"
+for every single customer would already score
+**`r sprintf("%.1f%%", 100 * mr$baseline_acc)`** accuracy here, while being
+completely useless, since it would flag zero of the real theft/non-payment cases.
+This is precisely the scenario precision/recall and ROC/AUC exist for.
+
+```{r roc, fig.cap="ROC curves for both models against the no-skill diagonal."}
+include_graphics(file.path(out_dir, "plots", "roc_curves.png"))
+```
+
+Both models land at a respectable, believable **AUC around 0.75**, consistent
+with published results on this dataset using classical (non-deep-learning)
+features, and *not* suspiciously close to 1.0, which would be a red flag for
+leakage.
+
+```{r cm, fig.cap="Confusion matrix at the Youden-optimal operating threshold."}
+include_graphics(file.path(out_dir, "plots", "confusion_matrix.png"))
+```
+
+At the Youden-optimal threshold the logistic model catches
+**`r sprintf("%.0f%%", 100*mr$cm_logit$recall)`** of true flagged accounts
+(recall) while roughly **`r sprintf("%.0f%%", 100*mr$cm_logit$precision)`**
+of everything it flags turns out to be a genuine positive (precision). That
+precision looks low in isolation, but it's the right trade for this use
+case: a flag here should trigger low-cost proactive outreach (a payment-plan
+offer, a HEAP screening call) long before anything resembling an
+accusation, so the cost of a false positive is small and the cost of a
+false negative (missing a household headed for disconnection) is not.
+
+```{r coef, fig.cap="Standardized logistic regression coefficients."}
+include_graphics(file.path(out_dir, "plots", "coefficients.png"))
+```
+
+The coefficients read the same story the density plots showed: usage
+*volatility* (`log_sd_kwh`, `cv_kwh`) and a longer *history of missing reads*
+are the strongest positive signals; a wide, stable, well-metered usage range
+(`range_ratio`) is the strongest protective signal.
+
+## 5. Forecasting the bill from real weather
+
+```{r load-weather}
+wthr <- readRDS(file.path(out_dir, "weather_results.rds"))
+```
+
+Everything above works from usage *shape*, not the bill amount. This section
+adds the missing piece: a real physical forecast of the bill itself, using
+the standard utility-industry **degree-day method**: electricity demand for
+heating and cooling scales with how far a day's temperature sits from a
+65°F "balance point," not with temperature directly.
+
+**The temperature data is real**: daily NYC-area records for all of 2015
+(chosen to line up with the SGCC data's own 2014-2016 window), from the
+public `zonination/weather-us` historical weather archive. **The dollar
+calibration is externally anchored, not invented**: the model's cooling-season
+sensitivity is set so that a full Jun-Sep cooling season matches NEADA's
+published 2026 Mid-Atlantic average summer cooling bill of **\$790**, a
+real, cited, independent number the model is checked against, not fit to.
+Heating sensitivity is set at 40% of the cooling rate, a stated assumption
+(Northeast homes lean on gas heat, so the *electric* bill's heating response
+is real but smaller) rather than a second anchored figure.
+
+```{r weather-plot, fig.cap="A full year of predicted bills from real NYC temperatures."}
+include_graphics(file.path(out_dir, "plots", "weather_bill_forecast.png"))
+```
+
+### The weather-shock simulator
+
+Real NYC heatwaves run 5-7 days with daily highs near 95-100°F. Swapping six
+days of the model's hottest month (August) for a representative heatwave day
+(mean temp 90°F) and recomputing that month's cooling degree-days raises the
+predicted bill from **\$`r sprintf("%.2f", wthr$baseline_bill)`** to
+**\$`r sprintf("%.2f", wthr$shock_bill)`**, a
+**`r sprintf("%.1f%%", 100 * (wthr$shock_bill / wthr$baseline_bill - 1))`**
+jump from six unusual days. Section 6 carries this shock through to its
+actual consequence: the same dollar increase means very different things at
+different incomes.
+
+## 6. A stochastic risk engine: the bill's lifecycle as a Markov chain
+
+```{r load-markov}
+markov <- readRDS(file.path(out_dir, "markov_results.rds"))
+```
+
+Sections 4-5 produce two numbers: an ML risk tier and a predicted bill.
+This section is what actually *uses* both of them together, by modeling a
+bill's status explicitly as a state that moves over time. Four states, one
+month per step, aligned with the HEFPA timeline in Section 7 (a ~35-day
+notice-to-disconnection window is, for a monthly model, "about one step"):
+
+**Current → Late (1-30 days) → Severe (31-60+ days, disconnection-eligible) → Disconnected** (absorbing in this model).
+
+Two different kinds of input set the transition probabilities, and this
+report is explicit about which is which:
+
+- **The `Current → Late` probability is grounded in the fitted classifier**:
+  it's set by the same Low / Elevated / High risk tier from Section 4's
+  logistic model.
+- **Once an account is late, whether it cures or progresses is set by a
+  stated, illustrative function of "stress index"** (predicted bill ÷ assumed
+  monthly income): rising stress lowers the cure probability and raises the
+  progress probability, clipped to valid probabilities. **This function is a
+  modeling assumption, not a measurement**: no public dataset labels
+  individual month-by-month delinquency transitions, so there is nothing to
+  fit it to. Saying so here, rather than presenting illustrative numbers as
+  empirical ones, is the entire point of keeping this section separate from
+  Section 4.
+
+All of the matrix algebra below (n-step transition matrices, the
+fundamental matrix, expected time to absorption) is implemented directly
+with base R linear algebra, `solve()` on `I - Q`, rather than a package
+call. I wanted this section to show the mechanics, not hide them behind a
+library.
+
+```{r markov-matrix}
+kable(round(markov$illustrative_matrix, 3), caption = "Example transition matrix: Elevated risk, near-HEAP-eligible income, typical August bill")
+```
+
+```{r markov-traj, fig.cap="State occupancy over 24 months for that example."}
+include_graphics(file.path(out_dir, "plots", "markov_trajectory.png"))
+```
+
+### Where the weather shock and income actually compound
+
+```{r markov-scenarios}
+kable(markov$scenario_results[, .(Tier = tier, Income = income_label, Bill = bill_label,
+                                    `Stress index` = stress_index,
+                                    `E[months to disconnect]` = expected_months_to_disconnect,
+                                    `P(disconnect, 12mo)` = scales::percent(p_disconnected_12mo, accuracy = 0.1))])
+```
+
+```{r markov-scenario-plot, fig.cap="The same 6-day heatwave, compared across risk tier and income."}
+include_graphics(file.path(out_dir, "plots", "markov_scenarios.png"))
+```
+
+Two things stand out. First, **risk tier alone spans a huge range**: at
+moderate income, a Low-risk account's expected time to disconnection is
+measured in decades (`r round(markov$scenario_results[tier=="Low" & income_label=="Moderate income ($3,000/mo)" & bill_label=="Typical August bill"]$expected_months_to_disconnect / 12, 0)`
+years, so effectively not a near-term concern), while a High-risk account
+at the same income is measured in years. Second, and this is what the
+weather-shock simulator was built to show: **the identical 6-day heatwave
+moves the 12-month disconnection probability by a larger absolute amount
+for the near-HEAP-eligible household than for the moderate-income one, in
+every risk tier.** The same weather event hits different households
+differently. Climate-economics research describes this equity mechanism;
+here it comes out of a fully specified model a reader can inspect.
+
+### How much do the stated assumptions matter? A sensitivity analysis
+
+The weakness of this chain, stated above, is that the transition
+probability functions for already-late accounts are assumptions rather
+than fitted values. The right response is to measure how much that
+matters: if the conclusions swung wildly whenever an assumed coefficient
+moved a little, the model would be decoration. So `09_sensitivity.R` runs
+two checks on the reference scenario (Elevated tier, near-HEAP-eligible
+income, typical August bill).
+
+```{r sens-load}
+sens <- readRDS(file.path(out_dir, "sensitivity_results.rds"))
+```
+
+**One at a time.** Each assumed parameter is moved ±20% from its stated
+value while the rest stay put:
+
+```{r sens-tornado, fig.cap="Tornado analysis: each assumed parameter perturbed ±20%, one at a time."}
+include_graphics(file.path(out_dir, "plots", "sensitivity_tornado.png"))
+```
+
+No single ±20% perturbation moves the 12-month disconnection probability
+by more than about ±0.03 around its stated-value run of
+`r round(sens$p12_base, 3)`. The most influential single parameter turns
+out to be the Elevated tier's base slip probability, and that is the one
+input anchored to the fitted classifier's operating thresholds rather
+than assumed. The model leans hardest on its best-grounded number, which
+is the right way around.
+
+**All at once.** A joint Monte Carlo draws every assumed parameter
+simultaneously from independent ±20% ranges
+(`r format(sens$n_valid, big.mark=",")` valid draws of
+`r format(sens$n_draws, big.mark=",")`):
+
+```{r sens-mc, fig.cap="Joint Monte Carlo: every assumed parameter drawn from a ±20% range simultaneously."}
+include_graphics(file.path(out_dir, "plots", "sensitivity_montecarlo.png"))
+```
+
+Even with everything perturbed at once, 95% of outcomes stay between
+`r round(sens$mc_quantiles[1], 3)` and `r round(sens$mc_quantiles[3], 3)`.
+The headline stays "roughly a one-in-five chance within a year" instead of
+flipping to negligible or near-certain. And the qualitative claim the
+project rests on, High risk above Elevated above Low at identical income
+and bill, holds in **`r scales::percent(sens$ordering_holds, accuracy = 0.1)` of joint draws**.
+The exact probabilities inherit the assumptions' uncertainty. The ordering
+and the order of magnitude do not.
+
+## 7. What happens after a bill actually goes unpaid
+
+This section is **not** a statistical model, on purpose. Section 4
+estimates a probability from usage data. This section states, as
+accurately as I could research it, what New York State utility regulation
+requires once a bill goes unpaid. Mixing the two, letting a risk score
+imply a legal timeline, would be a real error, so they're built and
+presented separately.
+
+```{r cascade}
+cons <- readRDS(file.path(out_dir, "consequences.rds"))
+kable(cons$cascade[, .(`Day (after due date)` = day_offset, Category = category, Event = event)])
+```
+
+**Primary sources:**
+
+- NY Dept. of Public Service, *"Your Rights as a Residential Gas, Electric or
+  Steam Customer Under HEFPA"* --
+  <https://dps.ny.gov/your-rights-residential-gas-electric-or-steam-customer-under-hefpa>
+  (15-day disconnection notice, 1.5%/month late fee, Nov 1-Apr 15 cold-weather
+  protections, deferred payment agreement terms, security deposit rules)
+- Consumer Financial Protection Bureau, on utility bills and credit
+  reports --
+  <https://www.consumerfinance.gov/ask-cfpb/does-my-history-of-paying-utility-bills-like-telephone-cable-electricity-or-water-go-in-my-credit-report-en-1817/>
+  (utilities generally do **not** report routine payment history to the major
+  credit bureaus; a credit-report impact typically requires the debt to be
+  referred to a third-party collection agency first)
+- UtilityExplained.com, reconnection fee ranges (a market survey, not a
+  regulatory figure; reconnection fees are set by each utility's own tariff)
+- NY OTDA HEAP guidelines (income tiers / benefit caps shown are **illustrative**
+  and republished yearly. Verify current figures at mybenefits.ny.gov before
+  relying on them for a real decision)
+
+```{r fee-proj, fig.cap="HEFPA's 1.5%/month late charge, compounding on the outstanding balance."}
+include_graphics(file.path(out_dir, "plots", "late_fee_projection.png"))
+```
+
+The most important fact in this section, and one a usage-based ML model
+could never tell you: **routine non-payment does not, by itself, damage a
+credit score.** New York utilities generally don't report ordinary payment
+history to the major bureaus at all. The credit consequence only attaches
+at a specific, later, avoidable step: referral to a third-party collection
+agency. That is the kind of fact that should reach a household *before*
+day 35, not after.
+
+### Turning a risk score into a recommended action
+
+```{r examples}
+kable(cons$examples[, .(Scenario = scenario, `Risk score` = round(risk_prob, 3), Tier = tier, `Recommended action` = action)])
+```
+
+This is where Sections 4 and 5 connect, without collapsing into each other:
+the ML model's output sets *when* to intervene; HEFPA and HEAP set *what the
+intervention actually offers*.
+
+## 8. Limitations
+
+- **The label is a proxy.** `FLAG` marks confirmed electricity theft, not
+  garden-variety late payment. The overlap is real (both are forms of revenue
+  loss the utility responds to) but not exact, and I'm not claiming otherwise.
+- **The consequence figures are New York-specific and time-bound.** HEFPA is
+  a New York State law; other states have different (sometimes much weaker)
+  protections. The HEAP numbers are one program-year's guidance and change
+  annually.
+- **Reconnection fees are not a single number.** They're set utility-by-utility
+  by tariff; the range shown is a market survey, not a rule.
+- **~26% of readings in the raw data are missing**, and missingness itself
+  turned out to be predictive (see Section 3). Some of what the model
+  learns is really "how well-monitored is this account," not purely "how
+  much electricity did it use."
+- **AUC ~0.75 is good, not great.** There's real room for improvement,
+  for example neighborhood or weather covariates, or the CNN approach from
+  the original paper. That open room is part of why this is a project and
+  not a solved problem.
+- **The weather module and the usage-risk model are not paired to the same
+  customers.** The SGCC data is Chinese and unlabeled by location; the
+  weather data is NYC history. They're joined only through the shared
+  2014-2016 time window and through the Markov chain's stated income and
+  tier inputs, and I don't claim they describe the same households.
+- **The Markov transition probabilities are assumptions, not
+  measurements.** Section 6 states this at the point of introduction, and
+  it's repeated here because it's the easiest thing in this project to
+  misread as more empirical than it is. What's real inside that section:
+  the four-state structure mirroring HEFPA's actual timeline, the risk
+  tiers from a fitted model, and the linear algebra connecting them. The
+  sensitivity analysis at the end of Section 6 quantifies how much this
+  limitation matters: ±20% perturbations of every assumed coefficient,
+  singly and jointly, leave the headline probability in the same band and
+  the tier ordering intact in 100% of draws.
+- **Disconnection is treated as absorbing.** Real accounts do get
+  reconnected; modeling it as a permanent absorbing state is a standard
+  simplification for this kind of analysis, not a claim that reconnection is
+  impossible.
+
+## 9. Reproducing this
+
+All code lives in `scripts/01` through `scripts/09`, run in order, from a
+plain R installation (`data.table`, `ggplot2`, `rpart`, `rmarkdown`, `knitr`
+-- no paid APIs required; `01`-`05` need the raw SGCC CSV in `data/data.csv`
+and `06`-`09` need the NYC weather CSV already included at
+`data/weather/nyc_weather_raw.csv`). See the top-level `README.md` for the
+exact dataset download link and citation.
