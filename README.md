@@ -1,59 +1,49 @@
-# Utility Non-Payment Risk & Consequence Model
+# Behind on the Bill
 
-By Hugo Garcia Moreno
+**Live at [behindonthebill.com](https://behindonthebill.com)** · Built by Hugo Garcia Moreno, math student at BMCC (CUNY)
 
-This project forecasts an electricity bill from real weather, predicts
-non-payment risk from real usage data, models how a bill's status evolves
-over time as a Markov chain, and maps out what actually happens next, in
-cited legal and financial detail, when a bill goes unpaid.
+I grew up in a house where the electric bill was a source of stress, and the
+worst part was not knowing what came next. When does the late fee hit? When
+can they actually shut the power off? So I built the thing I wish we had.
 
-**Live web app:** https://hugogarcia.shinyapps.io/utility-risk-model/
+Put your last electric bill into the first sentence on the site and it tells
+you three things:
 
-**Try it in 10 seconds:** enter your last electric bill in the app's left
-panel and every number recalibrates to your household.
+1. **What your bill should be every month.** I use 78 years of NOAA weather
+   for Central Park (1948 to 2025) and the degree-day method utilities use
+   themselves. Each month also shows the range it landed in 8 out of 10 years.
+2. **Your real chance of a shutoff.** I trained a logistic regression and a
+   decision tree on three years of daily meter readings from 33,787 real
+   customers (test AUC 0.755). Then I modeled the path from a late bill to a
+   shutoff as a Markov chain, month by month.
+3. **What to do today if you're behind.** New York's HEFPA law says the
+   utility has to offer a payment plan you can afford. The site works out that
+   plan, writes the request letter for you, and lists hotlines I checked
+   myself. It never asks for or saves anything personal.
 
-**Full report:** open `report/report.html` in a browser. It's a
-self-contained file with all charts and tables embedded, so no internet
-connection is needed.
+## How I checked my own work
 
-## The four parts
+I didn't want to just trust my R code, so I rebuilt the shutoff model in
+Python (`python/`). A script pulls the formulas straight out of the site's R
+code, and 26 tests show both versions agree to 12 decimal places. Then I
+checked it a second way, by simulating 400,000 households month by month and
+counting how many get cut off. The simulation and the formula never disagree
+by more than about a tenth of a percentage point.
 
-```
-[Real NYC weather] --> [Degree-day regression] --> [Predicted monthly bill]
-                                                            |
-                                                            v
-[Real SGCC usage data] --> [Logistic reg. + tree] --> [ML risk tier] --> [Markov chain risk engine] --> [P(disconnected), E[months to disconnect]]
-                                                                                   ^
-                                                                                   |
-                                                                    [HEFPA-cited consequence cascade]
-```
+A second Python script keeps the weather current. It downloads NOAA's data,
+checks that no month is missing and that the numbers add up, rebuilds the
+tables the site reads, and fits the climate trend (summers need about 15%
+more cooling than in 1948, winters about 11% less heating).
 
-1. A statistical model (logistic regression and a decision tree, written
-   in R from scratch) that estimates an account's risk of a serious
-   non-payment or billing problem from the shape of its daily electricity
-   usage over about 3 years: volatility, missing or zero reads, trend,
-   and seasonality. Trained and evaluated on 33,787 real customers from a
-   published utility dataset, with a test-set AUC around 0.75.
-2. A weather-driven bill forecast using the standard utility degree-day
-   method on 2015 NYC temperature history, calibrated so its summer
-   cooling add-on matches NEADA's published Mid-Atlantic average. It also
-   includes a heatwave shock simulator.
-3. A discrete-time Markov chain modeling a bill's lifecycle (Current to
-   Late to Severe to Disconnected) month by month, driven by the ML risk
-   tier and a bill-to-income stress index. The matrix algebra (n-step
-   transition matrices, the fundamental matrix, expected time to
-   absorption) is implemented directly in base R. The report is clear
-   about which inputs are fitted and which are stated assumptions, and a
-   sensitivity analysis measures how much the assumptions matter.
-4. A consequence cascade built from New York State's Home Energy Fair
-   Practices Act (HEFPA) and consumer finance sources. It turns a missed
-   bill into a day-by-day timeline, including the most useful fact in the
-   whole project: a missed utility bill by itself generally does not hit
-   your credit score. That only happens if the debt is referred to a
-   collection agency.
+## What's real and what's my assumption
 
-These four are different kinds of claims, and the report keeps the
-boundaries visible throughout. See Sections 1, 6, and 8.
+I try to be upfront about this. The weather, the meter data, the late fee
+and the shutoff rules are real and cited. What happens after an account goes
+late (does it catch up or keep sliding) uses probabilities I picked, because
+nobody publishes that data. I tested how much that matters: moving every
+assumed number 20% up or down never changed the one year shutoff chance by
+more than about 3 points. The full write-up is in `report/report.html`. Open it
+in a browser, everything is built in.
 
 ## Repository layout
 
@@ -73,7 +63,8 @@ report/
   report.html                   knitted, self-contained report (open this)
 data/
   README.md                     SGCC dataset citation and download instructions
-  weather/nyc_weather_raw.csv   daily NYC weather history, included
+  weather/nyc_weather_raw.csv   daily NYC weather history 1948-2015, included
+  weather/nyc_central_park_monthly_noaa.csv   NOAA monthly degree days, 1948 onward
 output/
   features.csv                   the engineered per-customer feature table
   consequence_cascade.csv         the HEFPA timeline as data
@@ -83,8 +74,17 @@ output/
   sensitivity_tornado.csv         sensitivity analysis results
   plots/                           all chart PNGs
 shiny_app/
-  app.R                            the public web app (self-contained, single file)
+  app.R                            the site (R Shiny)
+  www/fonts/                       the site's fonts (Archivo, Atkinson Hyperlegible)
+  data/                            weather tables the app reads (written by python/update_weather.py)
   README.md                        how to run it locally or deploy it
+python/
+  update_weather.py                downloads NOAA weather, checks it, rebuilds the site's data, fits the climate trend
+  test_update_weather.py           10 tests for the weather pipeline
+  markov_shutoff.py                the shutoff model in NumPy, plus a household simulation
+  test_markov_shutoff.py           26 tests, including exact matches against the R app
+  export_r_reference.R             pulls the model out of app.R and saves its answers
+  README.md                        what the Python check proves and what it doesn't
 explainer/
   project_explainer.md             a plain-language explanation of the whole project
 ```
@@ -109,8 +109,13 @@ place, everything runs offline.
   Convolutional Neural Networks for Electricity-Theft Detection to Secure
   Smart Grids." *IEEE Transactions on Industrial Informatics*, 14(4),
   1606-1615. https://doi.org/10.1109/TII.2017.2785963
-- Daily NYC-area weather history: [zonination/weather-us](https://github.com/zonination/weather-us)
-  (public GitHub archive).
+- Monthly heating and cooling degree days, New York Central Park station
+  (USW00094728), 1948 onward: NOAA National Centers for Environmental
+  Information, Global Summary of the Month. Downloaded and checked by
+  `python/update_weather.py`, saved in `data/weather/nyc_central_park_monthly_noaa.csv`.
+- Daily NYC-area weather history, 1948 to 2015: [zonination/weather-us](https://github.com/zonination/weather-us)
+  (public GitHub archive). Used by the report scripts and for the site's
+  replayed heat waves and cold snaps.
 - NEADA, 2026 Summer Residential Cooling Outlook, used to calibrate the
   weather-driven forecast.
 
