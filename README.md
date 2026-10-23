@@ -6,20 +6,23 @@ I grew up in a house where the electric bill was a source of stress, and the
 worst part was not knowing what came next. When does the late fee hit? When
 can they actually shut the power off? So I built the thing I wish we had.
 
-Put your last electric bill into the first sentence on the site and it tells
-you three things:
+Put your last electric bill and your state into the first sentence on the site
+and it tells you three things. It works for all 50 states and DC:
 
 1. **What your bill should be every month.** I use 78 years of NOAA weather
    for Central Park (1948 to 2025) and the degree-day method utilities use
-   themselves. Each month also shows the range it landed in 8 out of 10 years.
+   themselves. Every other state uses NOAA's 30-year normals for its biggest
+   city, its own electricity price, and EIA's average bill for that state.
 2. **Your real chance of a shutoff.** I trained a logistic regression and a
    decision tree on three years of daily meter readings from 33,787 real
    customers (test AUC 0.755). Then I modeled the path from a late bill to a
    shutoff as a Markov chain, month by month.
-3. **What to do today if you're behind.** New York's HEFPA law says the
-   utility has to offer a payment plan you can afford. The site works out that
-   plan, writes the request letter for you, and lists hotlines I checked
-   myself. It never asks for or saves anything personal.
+3. **What to do today if you're behind.** Each state's shutoff protections,
+   payment plan rules, late fee limits, complaint line, and energy assistance
+   program, checked against official sources in October 2026 (listed in
+   `shiny_app/data/state_info.csv`). It writes the request letter for you, has
+   the help page in English and Spanish, and never asks for or saves anything
+   personal.
 
 ## How I checked my own work
 
