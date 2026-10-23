@@ -103,6 +103,146 @@ STATE_PRICES <- data.frame(
 )
 NY_PRICE <- 29.93
 
+## ---------------------------------------------------------------
+## Every state and DC: weather normals, late fee rule, shutoff rules,
+## and where to get help. Collected in October 2026 from each state's
+## utility commission and energy assistance pages (the sources column
+## lists them), with weather from NOAA's 1991-2020 monthly normals for
+## each state's biggest city. New York keeps its full 78-year record.
+## ---------------------------------------------------------------
+STATE_INFO <- read.csv("data/state_info.csv", stringsAsFactors = FALSE, encoding = "UTF-8",
+                       na.strings = c("", "NA"))
+st_row <- function(name) {
+  r <- STATE_INFO[STATE_INFO$name == name, ]
+  if (nrow(r) == 0) STATE_INFO[STATE_INFO$code == "NY", ] else r
+}
+DAYS_IN_MONTH <- c(31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+BAND_LO <- HIST_MONTHLY$bill_p10 / HIST_MONTHLY$bill_mean
+## Level check against real bills. Weather and price alone overshoot in
+## places like Hawaii, where a lot of homes barely run AC. So each state's
+## yearly average is matched to the average residential bill EIA reports
+## for 2024, relative to New York (New York itself is unchanged). The
+## weather still decides which months run high or low.
+BAND_HI <- HIST_MONTHLY$bill_p90 / HIST_MONTHLY$bill_mean
+
+## Monthly heating and cooling points for a state. Average temperature
+## comes straight from the points, since heating minus cooling points is
+## exactly days x (65 - average temperature).
+state_climate <- function(name) {
+  if (identical(name, "New York"))
+    return(data.frame(hdd = HIST_MONTHLY$hdd_mean, cdd = HIST_MONTHLY$cdd_mean, mean_temp = HIST_MONTHLY$mean_temp))
+  r <- st_row(name)
+  hdd <- as.numeric(unlist(r[paste0("hdd", 1:12)])); cdd <- as.numeric(unlist(r[paste0("cdd", 1:12)]))
+  data.frame(hdd = hdd, cdd = cdd, mean_temp = BALANCE_POINT - (hdd - cdd) / DAYS_IN_MONTH)
+}
+
+## Late fees follow the state's own rule. monthly = that percent every
+## month on what's owed, once = a one-time charge, staged = Maryland's
+## 1.5%, 1.5%, then 2% capped at 5% total, none = not allowed, unset = no
+## statewide rule, so 1.5% a month stands in as a common example.
+STATE_SCALE <- local({
+  ny_model <- mean(HIST_MONTHLY$bill_mean)
+  ny_eia <- STATE_INFO$eia_bill_2024[STATE_INFO$code == "NY"]
+  sapply(setNames(STATE_INFO$name, STATE_INFO$name), function(n) {
+    if (n == "New York") return(1)
+    cl <- state_climate(n)
+    pf <- STATE_PRICES$price[STATE_PRICES$state == n] / NY_PRICE
+    model <- mean(BASELOAD + HEATING_RATE_PER_HDD * cl$hdd + COOLING_RATE_PER_CDD * cl$cdd) * pf
+    (STATE_INFO$eia_bill_2024[STATE_INFO$name == n] / ny_eia) / (model / ny_model)
+  })
+})
+
+late_balance <- function(bill, m, r) {
+  pct <- r$fee_pct / 100
+  switch(r$fee_kind,
+    none   = bill,
+    once   = if (m >= 1) bill * (1 + pct) else bill,
+    staged = bill * (1 + min(0.05, sum(c(0.015, 0.015, rep(0.02, 12))[seq_len(m)]))),
+    bill * (1 + pct)^m)
+}
+project_late_fees <- function(bill_amount, n_months = 12, r = st_row("New York")) {
+  data.frame(month = 0:n_months, balance = sapply(0:n_months, function(m) late_balance(bill_amount, m, r)))
+}
+pct_txt <- function(x) sub("\\.?0+$", "", formatC(x, format = "f", digits = 2))
+fee_rule_text <- function(r) {
+  nm <- r$name
+  switch(r$fee_kind,
+    none    = sprintf("%s doesn't allow late fees on home electric bills", nm),
+    once    = sprintf("%s lets utilities add a one-time late charge of up to %s%%", nm, pct_txt(r$fee_pct)),
+    staged  = sprintf("%s allows 1.5%%, then 1.5%%, then 2%%, capped at 5%% in total", nm),
+    monthly = sprintf("%s lets utilities charge up to %s%% a month on what you owe", nm, pct_txt(r$fee_pct)),
+    sprintf("%s doesn't set one statewide limit, so this uses 1.5%% a month, a common rate. Your bill shows yours", nm))
+}
+
+## Help page text for any state other than New York, in English or
+## Spanish. New York keeps its own detailed version (HELP_TEXT).
+HELP_DYNAMIC <- c("stamp_body", "s1", "s1_fine", "s3a", "s3b", "s4", "calc_fine", "protect_a", "protect_b", "protect_c")
+host_of <- function(u) sub("/.*$", "", sub("^https?://(www\\.)?", "", u))
+endp <- function(x) if (is.na(x) || !nzchar(x)) "" else if (grepl("[.!?]$", x)) x else paste0(x, ".")
+has <- function(x) length(x) == 1 && !is.na(x) && nzchar(as.character(x))
+
+state_help <- function(name, lang = "en") {
+  if (identical(name, "New York")) return(HELP_TEXT[[lang]][HELP_DYNAMIC])
+  r <- st_row(name); es <- identical(lang, "es")
+  ph <- r$complaint_phone; url <- r$complaint_url
+  ap <- r$assistance_phone; au <- r$assistance_url; an <- r$assistance_name
+  out <- list()
+  if (!es) {
+    out$stamp_body <- if (has(ph))
+      paste0("If your power got cut or is about to be, call your utility first and ask what it takes to keep it on. If they won't work with you, call the ",
+             r$commission_name, " at ", PH(ph), ". Then do step 1 today.")
+    else paste0("If your power got cut or is about to be, call your utility first and ask what it takes to keep it on. Dial ", PH("211"), " for local emergency help. Then do step 1 today.")
+    out$s1 <- paste0("Call the number on your bill, tell them you can't pay it all, and ask for a ", B("payment arrangement"),
+                     ". Some utilities call it a deferred payment agreement or an installment plan. In ", name, ": ", endp(r$plan_en),
+                     " Call early, before a final notice, while you still have the most options.")
+    out$s1_fine <- if (has(url)) paste0("Your rights in ", name, ": ", A(url, paste0("the ", r$commission_short, "'s consumer page")), ".") else ""
+    apply_part <- if (has(au) && has(ap)) paste0("Apply at ", A(au, host_of(au)), " or call ", PH(ap), ".")
+                  else if (has(au)) paste0("Apply at ", A(au, host_of(au)), ".")
+                  else if (has(ap)) paste0("Call ", PH(ap), " to apply.")
+                  else "Your local Community Action Agency takes applications."
+    out$s3a <- paste0("In ", name, ", the program that helps pay energy bills is ", B(an), ". It pays part of the bill for households that qualify, and most states also have emergency help when a shutoff is close. ", apply_part)
+    out$s3b <- paste0("Not sure who to call? The National Energy Assistance Referral line at ", PH("1-866-674-6327"),
+                      " can point you to the right office, or look up your state in the ", A("https://www.liheap.org/directory", "LIHEAP directory"), ".")
+    out$s4 <- paste0("If you get SNAP or Medicaid, ask your utility whether it has a low-income discount or a bill based on your income. A lot of utilities do, and a lot of families qualify without knowing it. When you apply for ",
+                     an, ", ask about weatherization help too. It lowers every bill after this one instead of just fixing this one.")
+    out$calc_fine <- "That's per month, on top of your regular bill. Each utility sets its own terms, so if these numbers are too high, tell them what you can actually pay and ask for a longer plan."
+    out$protect_a <- paste(endp(r$winter_en), endp(r$summer_en))
+    out$protect_b <- paste0(endp(r$medical_en), " If someone in your home is seriously ill, get a note from their doctor and tell the utility right away.",
+                            if (has(r$notice_days)) sprintf(" You should get written notice before any shutoff, %s days or more under state rules.", r$notice_days) else "")
+    out$protect_c <- paste0(if (has(ph)) paste0("Complaints: the ", r$commission_short, " at ", PH(ph),
+                                                if (has(url)) paste0(" or ", A(url, "online")) else "", ". ") else "",
+                            if (has(r$extra_en)) paste0(r$extra_en, " ") else "",
+                            "City-owned utilities and electric co-ops can follow their own rules, so ask yours.")
+  } else {
+    out$stamp_body <- if (has(ph))
+      paste0("Si ya te cortaron la luz o están por cortarla, llama primero a tu compañía y pregunta qué necesitas para que no la corten. Si no te ayudan, llama a la ",
+             r$commission_name, " al ", PH(ph), ". Después haz el paso 1 hoy mismo.")
+    else paste0("Si ya te cortaron la luz o están por cortarla, llama primero a tu compañía y pregunta qué necesitas para que no la corten. Marca ", PH("211"), " para ayuda local de emergencia. Después haz el paso 1 hoy mismo.")
+    out$s1 <- paste0("Llama al número que sale en tu factura, diles que no puedes pagar todo y pide un ", B("payment arrangement"),
+                     " (arreglo de pago). Algunas compañías lo llaman deferred payment agreement o installment plan. En tu estado: ", endp(r$plan_es),
+                     " Llama temprano, antes del aviso final, cuando todavía tienes más opciones.")
+    out$s1_fine <- if (has(url)) paste0("Tus derechos en tu estado: ", A(url, paste0("la página de la ", r$commission_short, " (en inglés)")), ".") else ""
+    apply_part <- if (has(au) && has(ap)) paste0("Aplica en ", A(au, host_of(au)), " o llama al ", PH(ap), ".")
+                  else if (has(au)) paste0("Aplica en ", A(au, host_of(au)), ".")
+                  else if (has(ap)) paste0("Llama al ", PH(ap), " para aplicar.")
+                  else "Tu Community Action Agency local recibe las solicitudes."
+    out$s3a <- paste0("En tu estado, el programa que ayuda a pagar la luz se llama ", B(an), ". Paga parte de la factura de los hogares que califican, y casi todos los estados tienen ayuda de emergencia cuando el corte está cerca. ", apply_part)
+    out$s3b <- paste0("¿No sabes a quién llamar? La línea National Energy Assistance Referral, ", PH("1-866-674-6327"),
+                      ", te dice a qué oficina ir, o busca tu estado en el ", A("https://www.liheap.org/directory", "directorio de LIHEAP"), ".")
+    out$s4 <- paste0("Si recibes SNAP o Medicaid, pregúntale a tu compañía si tiene un descuento para personas de bajos ingresos o una factura según tus ingresos. Muchas lo tienen, y muchas familias califican sin saberlo. Cuando apliques a ",
+                     an, ", pregunta también por ayuda de weatherization, que son arreglos para que tu casa gaste menos. Baja todas las facturas que vienen, no solo esta.")
+    out$calc_fine <- "Eso es por mes, además de tu factura normal. Cada compañía pone sus propias condiciones, así que si estos números son muy altos, diles cuánto puedes pagar de verdad y pide un plan más largo."
+    out$protect_a <- paste(endp(r$winter_es), endp(r$summer_es))
+    out$protect_b <- paste0(endp(r$medical_es), " Si alguien en tu casa está muy enfermo, pídele una nota a su doctor y avísale a la compañía enseguida.",
+                            if (has(r$notice_days)) sprintf(" Te tienen que avisar por escrito antes de cualquier corte, con %s días o más según las reglas del estado.", r$notice_days) else "")
+    out$protect_c <- paste0(if (has(ph)) paste0("Quejas: la ", r$commission_short, " al ", PH(ph),
+                                                if (has(url)) paste0(" o ", A(url, "en línea")) else "", ". ") else "",
+                            if (has(r$extra_es)) paste0(r$extra_es, " ") else "",
+                            "Las compañías de la ciudad y las cooperativas eléctricas pueden tener sus propias reglas, así que pregunta en la tuya.")
+  }
+  out
+}
+
 ## ML risk tiers -- from the fitted logistic model's own Youden-optimal
 ## operating threshold (0.493) on real SGCC data; see report Section 4.
 TIER_BASE_SLIP <- c(Low = 0.03, Elevated = 0.12, High = 0.28)
@@ -143,14 +283,6 @@ analyze_chain <- function(P, horizon = 24) {
   for (m in seq_len(horizon)) traj[m + 1, ] <- traj[m, ] %*% P
   list(expected_months = expected_steps["Current", 1], trajectory = traj,
        p6 = traj["6", "Disconnected"], p12 = traj["12", "Disconnected"])
-}
-
-## HEFPA late fee: 1.5%/month on outstanding balance (NY DPS, HEFPA)
-project_late_fees <- function(bill_amount, n_months = 12) {
-  balance <- bill_amount
-  out <- data.frame(month = 0, balance = balance)
-  for (m in seq_len(n_months)) { balance <- balance * 1.015; out <- rbind(out, data.frame(month = m, balance = balance)) }
-  out
 }
 
 ## Real Experian Q1 2026 average auto-loan APR by credit tier
@@ -571,6 +703,7 @@ app_theme <- bs_theme(
     .accordion-item { border-radius: 0 !important; }
     .accordion-button { border-radius: 0 !important; padding: 16px 20px; }
     .accordion-button:focus { box-shadow: 0 0 0 3px var(--amber); }
+    .help-state { margin: 0 0 14px 0; font-size: 19px; }
     .letter-box { width: 100%; background: var(--field); color: var(--ink); border: 1px solid var(--rule); padding: 12px; font-family: 'Atkinson Mono', ui-monospace, Menlo, monospace; font-size: 13px; margin-bottom: 10px; }
 
     /* The title: wide, heavy letters sitting up off the page on a short
@@ -642,7 +775,7 @@ HELP_TEXT <- list(
     more = paste0("A nonprofit credit counselor can help you make a plan for all your debts for free or close to it. Start at the ",
                   A("https://www.nfcc.org", "National Foundation for Credit Counseling"),
                   ". Watch out for for-profit \"debt relief\" companies that charge you for what nonprofits do free."),
-    more_fine = "I checked these numbers and programs against official sources in August 2026. Programs change, so the official pages linked here have the final say."
+    more_fine = "I checked these numbers and programs against official sources in October 2026. Programs change, so the official pages linked here have the final say."
   ),
   es = list(
     stamp = "\u00bfAVISO DE CORTE?",
@@ -679,7 +812,7 @@ HELP_TEXT <- list(
     more = paste0("Un consejero de cr\u00e9dito sin fines de lucro te puede ayudar a hacer un plan para todas tus deudas gratis o casi gratis. Empieza en la ",
                   A("https://www.nfcc.org", "National Foundation for Credit Counseling"),
                   ". Cuidado con las compa\u00f1\u00edas de \"debt relief\" que te cobran por lo que las organizaciones sin fines de lucro hacen gratis."),
-    more_fine = "Revis\u00e9 estos n\u00fameros y programas con fuentes oficiales en agosto de 2026. Los programas cambian, as\u00ed que las p\u00e1ginas oficiales tienen la \u00faltima palabra. Muchas de esas p\u00e1ginas est\u00e1n en ingl\u00e9s."
+    more_fine = "Revis\u00e9 estos n\u00fameros y programas con fuentes oficiales en octubre de 2026. Los programas cambian, as\u00ed que las p\u00e1ginas oficiales tienen la \u00faltima palabra. Muchas de esas p\u00e1ginas est\u00e1n en ingl\u00e9s."
   )
 )
 
@@ -830,7 +963,7 @@ ui <- page(
           inline_select("heat_fuel", c("electricity" = "elec", "gas, oil, or something else" = "other"), "elec", "15em"),
           "."),
         p(class = "fine-print", style = "margin:6px 0 0 0;",
-          "Skip the number if you want and you'll see a typical New York home. Nothing you type here is saved."),
+          "Skip the number if you want and you'll see a typical home in the state you pick. Nothing you type here is saved."),
         uiOutput("calib_note"),
         uiOutput("state_note")
       ),
@@ -855,9 +988,13 @@ ui <- page(
           p(class = "fine-print", style = "margin-top:8px;", textOutput("bill_range", inline = TRUE)),
           div(class = "perforation"),
           h4("What if the weather goes wild?", style = "font-size:19px; margin-bottom:4px;"),
-          p(class = "fine-print",
-            "Every event here really happened. The button picks one of the 20 hottest or coldest stretches New York recorded in this month between 1948 and 2015 and puts it on your bill."),
-          actionButton("shock_btn", "Replay a real heat wave or cold snap", class = "btn-primary", width = "100%"),
+          conditionalPanel("input.state == 'New York'",
+            p(class = "fine-print",
+              "Every event here really happened. The button picks one of the 20 hottest or coldest stretches New York recorded in this month between 1948 and 2015 and puts it on your bill."),
+            actionButton("shock_btn", "Replay a real heat wave or cold snap", class = "btn-primary", width = "100%")),
+          conditionalPanel("input.state != 'New York'",
+            p(class = "fine-print",
+              "Replays use New York's day by day weather records, the only daily history built into the site right now. Switch your state to New York to try it.")),
           conditionalPanel("output.shock_active",
             div(style = "margin-top:10px; font-size:14.5px;", textOutput("shock_desc")),
             actionButton("reset_btn", "Back to normal weather", class = "btn-outline-secondary btn-sm",
@@ -900,13 +1037,13 @@ ui <- page(
           p("When I started this project I wanted to figure out why bills jump in January and then again in July. Turns out energy companies already measure that with something called degree days. You take a day's average temperature and see how far it is from 65, which is about where nobody needs heat or AC. A day that averages 40 is 25 heating points. A day that averages 90 is 25 cooling points."),
           p(paste0("I pulled the official heating and cooling points for the Central Park weather station from NOAA, every month from ", FIRST_YEAR, " to ", LAST_YEAR, ". That's ", N_YEARS, " years. Summers have gotten hotter since the 1950s, so for what counts as normal now I use the last 30 years, which is the same window weather services use. To turn points into dollars I needed a real bill to check against. NEADA, the group of people who run energy assistance programs across the states, puts out the average summer cooling bill every year, so I matched a normal summer to theirs.")),
           p("Weather changes from year to year, so giving you one number would be lying a little. That's why each bar has a thin line on it. It shows where that month's bill landed in 8 out of 10 of those 30 years."),
-          p("Once you type in your own bill, the whole thing scales to your home. If yours runs 20% under a typical New York home, every month does too. If you heat with gas or oil, I take the heating part out since that's a different bill. Pick another state and I use that state's average electricity price."),
+          p("Once you type in your own bill, the whole thing scales to your home. If yours runs 20% under a typical New York home, every month does too. If you heat with gas or oil, I take the heating part out since that's a different bill. Pick another state and I use that state's average electricity price and NOAA's 30-year weather normals for its biggest city."),
           p(class = "how-limits",
-            "It can't see your actual apartment or your utility's exact rates. And it runs on New York weather, so if you live somewhere like Phoenix, go by the dollars more than the month to month pattern.")
+            "It can't see your actual apartment or your utility's exact rates. Outside New York it uses the weather of your state's biggest city, so if you live far from it, go by the dollars more than the exact pattern.")
         ),
         div(class = "how-example",
           h4("The math on an average January and July"),
-          p(class = "fine-print", "A typical New York home in this model, using the last 30 years of weather."),
+          p(class = "fine-print", "A typical New York home in this model, using the last 30 years of weather. Other states work the same way with their own weather and prices."),
           ledger_month(1),
           ledger_month(7, top_margin = TRUE),
           p(class = "fine-print", style = "margin-top:10px;",
@@ -1001,22 +1138,21 @@ ui <- page(
             div(class = "chart-key",
               span(span(class = "key-swatch", style = "background:var(--bar);"), "What you originally owed"),
               span(span(class = "key-swatch", style = "background:var(--amber);"), "Late fees on top"),
-              span(class = "key-tip", "New York lets utilities charge 1.5% a month on what you owe")
+              span(class = "key-tip", textOutput("fee_tip", inline = TRUE))
             )
           ))
         ),
         div(class = "step bad",
           div(class = "step-when", "If it gets shut off"),
           h3("Getting the lights back on"),
-          p("Getting it back costs more than what you owed. The utility can charge a reconnection fee. After two months behind or a shutoff, it can also ask for a deposit of up to twice your average monthly bill. If you're on public assistance, or you're 62 or older in most cases, you don't have to pay the deposit, and deposits earn interest."),
+          uiOutput("deposit_text"),
           div(class = "sheet", style = "max-width:560px;", div(class = "sheet-body",
             bill_line("Balance with late fees", textOutput("shutoff_balance", inline = TRUE)),
             bill_line("Reconnection fee (usual range)", "$20 to $150"),
             bill_line("Security deposit (up to)", textOutput("shutoff_deposit", inline = TRUE)),
             div(style = "margin-top:10px;", uiOutput("shutoff_total"))
           )),
-          p(class = "fine-print",
-            paste0("The deposit rule is 16 NYCRR 11.12 in New York's regulations. A typical bill here averages about $", round(mean(HIST_MONTHLY$bill_mean)), " a month over the year. Each utility sets its own reconnection fee, so that range comes from looking across utilities, not from one statewide number."))
+          uiOutput("deposit_fine")
         ),
         div(class = "step bad",
           div(class = "step-when", "If it goes to collections"),
@@ -1052,6 +1188,7 @@ ui <- page(
         div(
           sheet("Spec sheet",
             bill_line("Weather history", paste(N_YEARS, "yrs")),
+            bill_line("States covered", "50 + DC"),
             bill_line("Customers in training data", "33,787"),
             bill_line("Test AUC", "0.755"),
             bill_line("Months simulated", "24"),
@@ -1067,9 +1204,9 @@ ui <- page(
           p("I'm Hugo Garcia Moreno, a mathematics student at the Borough of Manhattan Community College (CUNY), headed toward quantitative finance and data science. The math running this site is the kind of math I'm studying, pointed at a problem I've actually lived."),
 
           h3("How it works"),
-          p("The bill estimate is the degree-day method I walk through on the first page. NOAA's Central Park numbers go in, a normal summer gets matched to NEADA's average, and the thin line on each bar is the real spread of the last 30 years."),
+          p("The bill estimate is the degree-day method I walk through on the first page. For New York, NOAA's Central Park numbers go in and the thin line on each bar is the real spread of the last 30 years. Every other state uses NOAA's 30-year normals for its biggest city and its own electricity price, and its typical year is matched to the average bill EIA reports for that state, so places like Hawaii, where a lot of homes barely run AC, don't come out way too high. A normal New York summer is matched to NEADA's average to set the dollar scale."),
           p("The risk part started with three years of smart meter readings from 33,787 real customers. I trained two models on them, a logistic regression and a decision tree. Only about 11% of those customers were problem accounts, so I weighted the models to care more about catching them. On customers the models had never seen, they scored an AUC of 0.755. The site can't run them live because they need three years of your meter readings, so your answer on the risk page picks the tier instead."),
-          p("The shutoff timeline is a Markov chain. Every month a bill is either paid up, late, really late, or shut off, and once it's shut off it stays that way. How long that usually takes comes from something called the fundamental matrix, N = (I - Q)^-1. The cost page adds New York's 1.5% monthly late fee and uses the normal loan payment formula for the car loan part."),
+          p("The shutoff timeline is a Markov chain. Every month a bill is either paid up, late, really late, or shut off, and once it's shut off it stays that way. How long that usually takes comes from something called the fundamental matrix, N = (I - Q)^-1. The cost page uses your state's late fee rule and the normal loan payment formula for the car loan part."),
 
           h3("Where Python comes in"),
           p("I use Python for two things. The first is keeping the weather current. One script downloads NOAA's numbers, checks that no month is missing and that each month's points match its average temperature, then rebuilds the tables this site reads. It also fits the climate trend on the first page."),
@@ -1081,15 +1218,16 @@ ui <- page(
             tags$li("Daily New York City temperatures from 1948 to 2015, from a public weather archive. The replayed heat waves and cold snaps come from here, since NOAA's monthly totals don't have single days."),
             tags$li("Smart meter readings for 33,787 customers over three years, from the State Grid Corporation of China dataset (Zheng et al., 2018)."),
             tags$li("NEADA's average summer cooling bill for the dollar scale."),
-            tags$li("New York's Home Energy Fair Practices Act (HEFPA) for the late fee and the shutoff rules."),
+            tags$li("NOAA's 1991 to 2020 monthly normals for the biggest city in every other state and DC."),
+            tags$li("Each state's utility commission rules and consumer pages, and its energy assistance program, for the late fees, shutoff protections, and help on the last page. All 50 states and DC, checked in October 2026. New York's rules come from its Home Energy Fair Practices Act (HEFPA)."),
             tags$li("Experian's early 2026 car loan rates by credit tier."),
-            tags$li("EIA's average electricity price for each state (May 2026)."),
-            tags$li("Open-Meteo for the live New York temperature.")
+            tags$li("EIA's average electricity price for each state (May 2026), and EIA's 2024 average residential bill for each state."),
+            tags$li("Open-Meteo for the live temperature.")
           ),
 
           h3("What I assumed, and what this can't do"),
           p("A few things here are my calls, not measured facts. What happens after an account goes late, whether it catches up or keeps sliding, uses probabilities I picked, because nobody publishes that data. The heating rate is set at 40% of the cooling rate since most New York homes heat mostly with gas. Electricity is one flat price adjusted for your state, even though real rates change by utility and season."),
-          p("It also uses New York's weather no matter what state you pick. The state changes the price, not the climate, so a Phoenix summer or a Minnesota winter will be off by more than the range shows. The late fee and the shutoff rules are New York's too."),
+          p("Outside New York, the weather is your state's biggest city, so a mountain town or a far corner of a big state will be off. The 8-in-10-years range borrows New York's year to year swings, and the weather replays and the climate trend use New York's records. State rules can also differ for city-owned utilities and co-ops, and a few states' rules I couldn't fully confirm. Where that's true, the help page says so."),
           p("I tested how much my guesses matter in the full report. Moving every assumed number 20% up or down never changed the one year shutoff chance by more than about 3 points, and the risk tiers stayed in the same order in all 2,000 simulation runs."),
           p("Every chance on this site is an estimate from patterns and assumptions. It can't tell you what your utility will actually do with your account. This isn't financial advice either. For your real situation, call your utility or talk to a housing or financial counselor."),
 
@@ -1098,6 +1236,8 @@ ui <- page(
             tags$li("NOAA National Centers for Environmental Information, Global Summary of the Month, station USW00094728 (New York Central Park)."),
             tags$li("Zheng et al. (2018), IEEE Transactions on Industrial Informatics. SGCC electricity theft dataset."),
             tags$li("NY Dept. of Public Service, HEFPA consumer rights guide."),
+            tags$li("NOAA NCEI, U.S. Climate Normals 1991-2020, monthly heating and cooling degree days."),
+            tags$li("State public utility commission rules and consumer pages, and state LIHEAP offices, for all 50 states and DC (each one is listed in data/state_info.csv on GitHub)."),
             tags$li("Consumer Financial Protection Bureau, on utility bills and credit reports."),
             tags$li("Experian, \"Average Car Loan Interest Rates by Credit Score,\" Q1 2026."),
             tags$li("NEADA, 2026 Summer Residential Cooling Outlook.")
@@ -1117,17 +1257,21 @@ ui <- page(
         radioButtons("help_lang", NULL, inline = TRUE,
                      choiceNames = list("English", "Espa\u00f1ol"), choiceValues = list("en", "es"),
                      selected = "en")),
+      div(class = "help-state sentence",
+        span(`data-display-if` = "input.help_lang != 'es'", `data-ns-prefix` = "", "Help for "),
+        span(`data-display-if` = "input.help_lang == 'es'", `data-ns-prefix` = "", "Ayuda para "),
+        inline_select("help_state", STATE_PRICES$state, "New York", "12em")),
       div(class = "stamp-box",
         span(class = "stamp", tr("stamp", inline = TRUE)),
-        div(style = "font-size:17px;", tr("stamp_body"))
+        div(style = "font-size:17px;", uiOutput("hs_stamp_body"))
       ),
       div(class = "help-grid",
         sheet(tr("steps_label", inline = TRUE),
           div(class = "help-step",
             div(class = "help-num", "1"),
             div(h4(tr("s1_h", inline = TRUE)),
-                p(tr("s1", inline = TRUE)),
-                p(class = "fine-print", tr("s1_fine", inline = TRUE)))
+                p(uiOutput("hs_s1", inline = TRUE)),
+                p(class = "fine-print", uiOutput("hs_s1_fine", inline = TRUE)))
           ),
           div(class = "help-step",
             div(class = "help-num", "2"),
@@ -1141,14 +1285,14 @@ ui <- page(
           div(class = "help-step",
             div(class = "help-num", "3"),
             div(h4(tr("s3_h", inline = TRUE)),
-                p(tr("s3a", inline = TRUE)),
-                p(tr("s3b", inline = TRUE)),
+                p(uiOutput("hs_s3a", inline = TRUE)),
+                p(uiOutput("hs_s3b", inline = TRUE)),
                 p(tr("s3c", inline = TRUE)))
           ),
           div(class = "help-step",
             div(class = "help-num", "4"),
             div(h4(tr("s4_h", inline = TRUE)),
-                p(tr("s4", inline = TRUE)))
+                p(uiOutput("hs_s4", inline = TRUE)))
           )
         ),
         div(
@@ -1157,12 +1301,12 @@ ui <- page(
             bill_line(tr_over(1), textOutput("dpa6", inline = TRUE)),
             bill_line(tr_over(2), textOutput("dpa12", inline = TRUE)),
             bill_line(tr_over(3), textOutput("dpa24", inline = TRUE)),
-            p(class = "fine-print", style = "margin-top:10px;", tr("calc_fine", inline = TRUE))
+            p(class = "fine-print", style = "margin-top:10px;", uiOutput("hs_calc_fine", inline = TRUE))
           ),
           sheet(tr("protect_label", inline = TRUE),
-            p(tr("protect_a", inline = TRUE)),
-            p(tr("protect_b", inline = TRUE)),
-            p(tr("protect_c", inline = TRUE))
+            p(uiOutput("hs_protect_a", inline = TRUE)),
+            p(uiOutput("hs_protect_b", inline = TRUE)),
+            p(uiOutput("hs_protect_c", inline = TRUE))
           ),
           sheet(tr("more_label", inline = TRUE),
             p(tr("more", inline = TRUE)),
@@ -1185,7 +1329,7 @@ server <- function(input, output, session) {
   ## ---- Welcome, once per visit ----
   showModal(modalDialog(
     title = "Behind on the Bill",
-    p(paste0("This site figures out what your electric bill should look like using ", N_YEARS, " years of New York weather, and shows what really happens if one goes unpaid.")),
+    p("This site figures out what your electric bill should look like using NOAA weather records for your state, and shows what really happens if one goes unpaid, with the rules and help for all 50 states and DC."),
     p("Put your last bill in the first sentence on the next page and everything changes to match your home."),
     footer = div(class = "welcome-actions",
       tags$button(type = "button", class = "btn btn-primary btn-lg", `data-dismiss` = "modal", `data-bs-dismiss` = "modal", "Show me my bill"),
@@ -1214,31 +1358,35 @@ server <- function(input, output, session) {
   heat_on <- reactive({ !identical(input$heat_fuel, "other") })
   price_factor <- reactive({
     pr <- STATE_PRICES$price[STATE_PRICES$state == input$state]
-    if (length(pr) == 0) 1 else pr / NY_PRICE
+    if (length(pr) == 0) 1 else pr / NY_PRICE * STATE_SCALE[[input$state]]
   })
 
   ## Model-household dollars per month under the current fuel + state,
   ## before personal scaling. The bill model is linear in degree-days, so
   ## dropping the heating component is exact; the 80% band is rescaled in
   ## proportion to each month's remaining bill.
+  sclim <- reactive(state_climate(input$state))
+  srow  <- reactive(st_row(input$state))
   model_dollars <- reactive({
-    heat <- if (heat_on()) HEATING_RATE_PER_HDD * HIST_MONTHLY$hdd_mean else 0
-    base <- BASELOAD + heat + COOLING_RATE_PER_CDD * HIST_MONTHLY$cdd_mean
-    ratio <- base / HIST_MONTHLY$bill_mean
+    cl <- sclim()
+    heat <- if (heat_on()) HEATING_RATE_PER_HDD * cl$hdd else 0
+    base <- BASELOAD + heat + COOLING_RATE_PER_CDD * cl$cdd
+    ## The 8-in-10-years band keeps New York's year to year swing for each
+    ## month, as a share of that month's bill
     data.frame(month = HIST_MONTHLY$month,
                bill = base * price_factor(),
-               p10  = HIST_MONTHLY$bill_p10 * ratio * price_factor(),
-               p90  = HIST_MONTHLY$bill_p90 * ratio * price_factor(),
-               HDD = HIST_MONTHLY$hdd_mean, CDD = HIST_MONTHLY$cdd_mean,
-               mean_temp = HIST_MONTHLY$mean_temp)
+               p10  = base * BAND_LO * price_factor(),
+               p90  = base * BAND_HI * price_factor(),
+               HDD = cl$hdd, CDD = cl$cdd,
+               mean_temp = cl$mean_temp)
   })
 
   output$state_note <- renderUI({
     if (identical(input$state, "New York")) return(NULL)
     pr <- STATE_PRICES$price[STATE_PRICES$state == input$state]
     div(class = "note",
-        sprintf("Priced at %s's average residential rate, %.1f cents/kWh vs New York's %.1f (EIA, May 2026). The seasonal shape still follows New York's climate, so if your weather differs a lot, treat the pattern loosely.",
-                input$state, pr, NY_PRICE))
+        sprintf("Priced at %s's average residential rate, %.1f cents/kWh (EIA, May 2026), with NOAA's 30-year weather normals for %s, and its typical year matched to EIA's 2024 average bill for the state. The 8-in-10-years range borrows New York's year to year swings, since that's the long record built into the site.",
+                input$state, pr, srow()$city))
   })
 
   ## Personal calibration: if the visitor enters their own last bill, the
@@ -1292,6 +1440,7 @@ server <- function(input, output, session) {
   })
   observeEvent(input$reset_btn, { shock$active <- FALSE })
   observeEvent(input$month, { shock$active <- FALSE })
+  observeEvent(input$state, { shock$active <- FALSE })
 
   output$shock_active <- reactive({ shock$active })
   outputOptions(output, "shock_active", suspendWhenHidden = FALSE)
@@ -1405,7 +1554,8 @@ server <- function(input, output, session) {
   live_temp <- reactive({
     tryCatch({
       old <- getOption("timeout"); options(timeout = 5); on.exit(options(timeout = old), add = TRUE)
-      u <- "https://api.open-meteo.com/v1/forecast?latitude=40.7128&longitude=-74.006&current=temperature_2m&temperature_unit=fahrenheit"
+      r <- srow()
+      u <- sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m&temperature_unit=fahrenheit", r$lat, r$lon)
       txt <- paste(suppressWarnings(readLines(u, warn = FALSE)), collapse = "")
       m <- regmatches(txt, regexpr('temperature_2m"\\s*:\\s*-?[0-9.]+', txt))
       if (!length(m)) return(NULL)
@@ -1418,7 +1568,7 @@ server <- function(input, output, session) {
     t <- live_temp()
     if (is.null(t)) return(NULL)
     cur_mo <- as.integer(format(Sys.Date(), "%m"))
-    norm <- HIST_MONTHLY$mean_temp[cur_mo]
+    norm <- sclim()$mean_temp[cur_mo]
     mo_full <- month.name[cur_mo]
     diff <- t - norm
     diff_txt <- if (abs(diff) < 1) sprintf("right at the %s average", mo_full)
@@ -1426,7 +1576,7 @@ server <- function(input, output, session) {
     hdd_day <- max(BALANCE_POINT - t, 0); cdd_day <- max(t - BALANCE_POINT, 0)
     heat <- if (heat_on()) HEATING_RATE_PER_HDD * hdd_day * 30 else 0
     month_like_today <- (BASELOAD + heat + COOLING_RATE_PER_CDD * cdd_day * 30) * price_factor() * personal_factor()
-    sheet("Right now in New York",
+    sheet(paste("Right now in", if (identical(input$state, "New York")) "New York" else srow()$city),
         p(style = "margin:0;",
           HTML(sprintf("It's <strong>%.0f F</strong> outside, %s. A whole month of days like today would run about <strong>$%.0f</strong>.",
                        t, diff_txt, month_like_today))),
@@ -1527,10 +1677,12 @@ server <- function(input, output, session) {
     } else {
       sprintf(" Winters went the other way and need about %.0f%% less heating, but your heat isn't on this bill.", abs(ti$w$pct_change))
     }
-    p(class = "chart-headline",
+    ny_note <- if (!identical(input$state, "New York"))
+      p(class = "fine-print", style = "margin:0 0 6px 0;", "This part uses New York's 78-year weather record, the long history built into the site, priced for your state.")
+    tagList(ny_note, p(class = "chart-headline",
       HTML(sprintf("New York summers now need about %s more cooling than when these records start in %d. For %s, that's about %s more every summer at today's prices.%s",
                    B(sprintf("%.0f%%", ti$s$pct_change)), ti$s$first_year, who,
-                   B(sprintf("$%.0f", ti$summer_extra)), heat_part)))
+                   B(sprintf("$%.0f", ti$summer_extra)), heat_part))))
   })
 
   output$trend_plot <- renderPlotly({
@@ -1615,8 +1767,10 @@ server <- function(input, output, session) {
         p(style = "margin-bottom:6px;",
           HTML(paste0("If a shutoff notice is in your hand, two moves change everything. Call the number on your bill and ask for a ",
                       B("deferred payment agreement"),
-                      ", which stops the shutoff clock. If service is about to be cut, call the state's emergency line at ",
-                      "<span class='phone'>1-800-342-3355</span>."))),
+                      ", which stops the shutoff clock. ",
+                      if (identical(input$state, "New York")) "If service is about to be cut, call the state's emergency line at <span class='phone'>1-800-342-3355</span>."
+                      else if (has(srow()$complaint_phone)) paste0("If they won't work with you, call the ", srow()$commission_short, " at <span class='phone'>", srow()$complaint_phone, "</span>.")
+                      else "If service is about to be cut, dial <span class='phone'>211</span> for local emergency help."))),
         actionButton("goto_help", "See everything that can help", class = "btn-danger btn-sm")
       )
     } else NULL
@@ -1713,8 +1867,11 @@ server <- function(input, output, session) {
   ## ---- Late Fee & Credit Impact tab ----
   output$fee_headline <- renderUI({
     req(input$unpaid_bill)
-    m <- input$months_unpaid; bal <- input$unpaid_bill * 1.015^m
-    txt <- if (m == 0) sprintf("Paid on time, a %s bill stays %s. Move the slider to see what waiting costs.",
+    m <- input$months_unpaid; bal <- late_balance(input$unpaid_bill, m, srow())
+    txt <- if (m > 0 && bal - input$unpaid_bill < 0.5)
+             sprintf("%s doesn't allow late fees on home electric bills, so a %s bill stays %s. The real cost of waiting is the shutoff risk.",
+                     input$state, B(sprintf("$%.0f", input$unpaid_bill)), B(sprintf("$%.0f", input$unpaid_bill)))
+           else if (m == 0) sprintf("Paid on time, a %s bill stays %s. Move the slider to see what waiting costs.",
                                B(sprintf("$%.0f", input$unpaid_bill)), B(sprintf("$%.0f", input$unpaid_bill)))
            else sprintf("Leave a %s bill unpaid for %d month%s and you owe %s. That's %s in fees for nothing.",
                         B(sprintf("$%.0f", input$unpaid_bill)), m, if (m == 1) "" else "s",
@@ -1727,7 +1884,7 @@ server <- function(input, output, session) {
   output$fee_plot <- renderPlotly({
     k <- pc()
     req(input$unpaid_bill)
-    df <- project_late_fees(input$unpaid_bill, 12)
+    df <- project_late_fees(input$unpaid_bill, 12, srow())
     df$fees <- df$balance - input$unpaid_bill
     m <- input$months_unpaid
     op <- ifelse(df$month == m, 1, 0.4)
@@ -1794,15 +1951,27 @@ server <- function(input, output, session) {
   output$extra_cost <- renderText({ sprintf("$%s", formatC(round(credit_calc()$total_after - credit_calc()$total_now), format = "d", big.mark = ",")) })
 
   ## ---- Shutoff cost panel ----
-  AVG_MONTHLY_BILL <- mean(HIST_MONTHLY$bill_mean)
+  avg_bill <- reactive(mean(climate_df()$predicted_bill))
+  output$fee_tip <- renderText(fee_rule_text(srow()))
   shutoff_calc <- reactive({
-    balance <- input$unpaid_bill * (1.015 ^ input$months_unpaid)
-    deposit_cap <- 2 * AVG_MONTHLY_BILL
+    balance <- late_balance(input$unpaid_bill, input$months_unpaid, srow())
+    deposit_cap <- 2 * avg_bill()
     list(balance = balance, deposit_cap = deposit_cap,
          lo = balance + 20, hi = balance + 150 + deposit_cap)
   })
   output$shutoff_balance <- renderText({ sprintf("$%.0f", shutoff_calc()$balance) })
   output$shutoff_deposit <- renderText({ sprintf("$%.0f", shutoff_calc()$deposit_cap) })
+  output$deposit_text <- renderUI({
+    if (identical(input$state, "New York"))
+      p("Getting it back costs more than what you owed. The utility can charge a reconnection fee. After two months behind or a shutoff, it can also ask for a deposit of up to twice your average monthly bill. If you're on public assistance, or you're 62 or older in most cases, you don't have to pay the deposit, and deposits earn interest.")
+    else
+      p("Getting it back costs more than what you owed. The utility can charge a reconnection fee, and after a shutoff it can often ask for a security deposit too. Many states cap that deposit at around two months of bills, and some waive it for people on public assistance, so ask yours what applies.")
+  })
+  output$deposit_fine <- renderUI({
+    p(class = "fine-print", if (identical(input$state, "New York"))
+      paste0("The deposit rule is 16 NYCRR 11.12 in New York's regulations. A typical bill here averages about $", round(avg_bill()), " a month over the year. Each utility sets its own reconnection fee, so that range comes from looking across utilities, not from one statewide number.")
+    else paste0("The deposit line uses two months of a typical bill in ", input$state, " (about $", round(avg_bill()), " a month) as a rough ceiling. Each utility sets its own reconnection fee and deposit, so treat these as ballpark numbers."))
+  })
   output$shutoff_total <- renderUI({
     sc <- shutoff_calc()
     p(style = "font-size:16px; margin-bottom:0;",
@@ -1816,6 +1985,7 @@ server <- function(input, output, session) {
     if (is.null(bal) || is.na(bal) || bal <= 0) bal <- 0
     afford <- input$dpa_afford
     monthly <- if (!is.null(afford) && !is.na(afford) && afford >= 10) round(afford) else max(10, round(bal / 12))
+    ny <- identical(input$state, "New York"); r <- srow()
     paste0(
 format(Sys.Date(), "%B %d, %Y"), "\n\n",
 "To: [Your utility company], Customer Assistance\n",
@@ -1823,11 +1993,13 @@ format(Sys.Date(), "%B %d, %Y"), "\n\n",
 "Service address: [your address]\n\n",
 "To whom it may concern,\n\n",
 "I am a residential customer and my account carries an unpaid balance of about $", formatC(round(bal), format = "d", big.mark = ","), ". ",
-"I am writing to request a deferred payment agreement under New York's Home Energy Fair Practices Act (Public Service Law and 16 NYCRR Part 11).\n\n",
+if (ny) "I am writing to request a deferred payment agreement under New York's Home Energy Fair Practices Act (Public Service Law and 16 NYCRR Part 11).\n\n"
+else "I am writing to ask for a payment arrangement on my past-due balance.\n\n",
 "Based on my current finances, I can pay $", monthly, " per month toward the balance, in addition to my current monthly bills. ",
-"I understand HEFPA requires payment agreement terms to reflect a customer's financial circumstances, and that agreements as low as no money down and ten dollars per month are available to customers who cannot afford more.\n\n",
+if (ny) "I understand HEFPA requires payment agreement terms to reflect a customer's financial circumstances, and that agreements as low as no money down and ten dollars per month are available to customers who cannot afford more.\n\n"
+else "I am asking for terms that fit what I can actually pay.\n\n",
 "Please send me a written agreement to sign, and please hold any pending disconnection while this request is processed. ",
-"If my account qualifies for assistance programs such as HEAP or an energy affordability discount, please tell me how to apply.\n\n",
+"If my account qualifies for assistance programs such as ", if (ny) "HEAP or an energy affordability discount" else paste0(r$assistance_name, " or a low-income discount"), ", please tell me how to apply.\n\n",
 "You can reach me at [your phone number or email].\n\n",
 "Sincerely,\n",
 "[Your name]\n")
@@ -1844,8 +2016,22 @@ format(Sys.Date(), "%B %d, %Y"), "\n\n",
   ## ---- Get Help tab: DPA payment plan calculator ----
   dpa_monthly <- function(months) {
     req(input$dpa_balance)
-    max(input$dpa_balance / months, 10)  # HEFPA floor: installments can be as low as $10/month
+    if (identical(input$state, "New York")) max(input$dpa_balance / months, 10)  # HEFPA floor: as low as $10/month
+    else input$dpa_balance / months
   }
+  ## The help page has its own state picker that stays in step with the
+  ## one on the first page, so either one changes everything
+  observeEvent(input$state, {
+    if (!identical(input$help_state, input$state)) updateSelectInput(session, "help_state", selected = input$state)
+  })
+  observeEvent(input$help_state, {
+    if (!identical(input$help_state, input$state)) updateSelectInput(session, "state", selected = input$help_state)
+  }, ignoreInit = TRUE)
+  help_strings <- reactive(state_help(input$state, if (identical(input$help_lang, "es")) "es" else "en"))
+  lapply(HELP_DYNAMIC, function(k) {
+    output[[paste0("hs_", k)]] <- renderUI(HTML(help_strings()[[k]]))
+  })
+
   output$dpa6  <- renderText({ sprintf("$%.0f", dpa_monthly(6)) })
   output$dpa12 <- renderText({ sprintf("$%.0f", dpa_monthly(12)) })
   output$dpa24 <- renderText({ sprintf("$%.0f", dpa_monthly(24)) })
